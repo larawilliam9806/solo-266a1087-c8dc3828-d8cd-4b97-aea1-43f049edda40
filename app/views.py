@@ -89,6 +89,7 @@ def _state_json(state: dict) -> dict:
             "base_shard": manifest.longest_indices[0] if manifest.longest_indices else None,
         },
         "recovery_target": target,
+        "recovery_cost_bytes": state["recovery_cost_bytes"],
         "recovered_index": delivery["recovered_index"],
         "used_recovery": delivery["recovered_index"] is not None,
         "download_ready": state["complete"],

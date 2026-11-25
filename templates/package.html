@@ -50,9 +50,20 @@
 <section class="card">
   <h2>用校验片恢复缺片</h2>
   <p class="hint">
-    校验片是原片尾部补零至最长片（{{ m.max_size | filesize }}）后逐字节异或所得。
-    上传后由校验片与其余已验收片逐字节异或恢复缺片，截回清单长度
+    校验片是原片尾部补零至最长片（{{ m.max_size | filesize }}）后逐字节异或所得，
+    其<strong>实际字节数必须恰为 {{ m.max_size }} 字节</strong>（与清单最长片一致）。
+    恢复时只读取各已验收片不超过缺片长度的前缀（每片最多
+    {{ state.recovery_target.size }} 字节），校验片与其余片异或所得截回清单长度
     （片 {{ target.index }}，{{ target.size }} 字节），再通过 SHA-256 核验才计入交付。
+  </p>
+  <p class="hint">
+    本次补片新建的分片数据不超过缺片字节数（
+    <strong>{{ state.recovery_cost_bytes | filesize }}</strong>）；
+    校验片从上传流直接读取，不写入数据卷。
+    {% if state.accepted_count > 32 %}
+    已验收片分 {{ (state.accepted_count + 31) // 32 }} 批读取，
+    {% endif %}
+    每批同时打开至多 32 个文件，其他交接包不受影响。
   </p>
   <form class="stack" method="post"
         action="{{ url_for('main.recover_page', delivery_id=d.id) }}"

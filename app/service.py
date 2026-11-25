@@ -96,6 +96,11 @@ def delivery_state(delivery_id: int) -> dict:
         "recovery_target": next(
             (s for s in shards if missing and s["index"] == missing[0]), None
         ),
+        # 一次补片新建的分片数据上限：恰为缺片字节数。
+        "recovery_cost_bytes": (
+            manifest.by_index[missing[0]].size if len(missing) == 1 else None
+        ),
+        "checkshard_length": manifest.max_size,
     }
 
 
@@ -309,6 +314,14 @@ def recover_missing(delivery_id: int, index: int, file_storage) -> dict:
     accepted_indices = [r["shard_index"] for r in rows if r["accepted_at"] is not None]
     missing = [r["shard_index"] for r in rows if r["accepted_at"] is None]
     if not missing:
+        # 末片已由实交（或上一次恢复）先入账：沿用已有记录，不重复写入。
+        row = next(
+            (r for r in rows if r["shard_index"] == spec.index), None
+        )
+        if row is not None and row["accepted_at"] is not None:
+            return _reuse_result(
+                row, spec.index, "该片此前已入账，本次补片沿用已有记录"
+            )
         raise HandoverError("清单内所有片均已验收，无需恢复", 409)
     if len(missing) != 1:
         raise HandoverError(
@@ -319,31 +332,23 @@ def recover_missing(delivery_id: int, index: int, file_storage) -> dict:
     if missing[0] != spec.index:
         raise HandoverError(f"应恢复缺片 {missing[0]}，而非片 {spec.index}", 409)
 
-    staging = _staging_path(delivery_id, f"checkshard{spec.index}")
     recovered_tmp = None
     try:
-        # 1. 校验片落暂存，长度必须等于最长片长度。
-        _upload_sha, upload_size = _stream_to_staging(
-            file_storage, staging, limit=manifest.max_size
-        )
-        if upload_size != manifest.max_size:
-            raise HandoverError(
-                f"校验片长度应为 {manifest.max_size} 字节（最长片长度），实收 {upload_size}",
-                422,
-            )
-
-        # 2. 校验片 ⊕ 其余已验收片 = 缺片；按清单长度截断并核验 SHA-256。
+        # 1. 校验片不落盘：直接按固定分块读取，边读边与其余已验收片异或前缀。
+        #    只新建「恢复所得缺片」一个文件，其长度恰为缺片长度。
         data_dir = _data_dir()
         recovered_tmp = _staging_path(delivery_id, f"recovered{spec.index}")
         try:
             rec_size, rec_sha = codec.recover_part(
-                staging,
+                file_storage.stream,
                 manifest.max_size,
                 _part_sources(manifest, data_dir, delivery_id, accepted_indices),
                 spec.size,
                 recovered_tmp,
                 chunk_size=_chunk(),
             )
+        except codec.CheckshardLengthError as exc:
+            raise HandoverError(str(exc), 422) from exc
         except storage.StorageError as exc:
             raise HandoverError(str(exc), 507) from exc
         if rec_size != spec.size:
@@ -360,40 +365,50 @@ def recover_missing(delivery_id: int, index: int, file_storage) -> dict:
         # 3. 写锁内复核：若实交已先完成，则恢复不写入、沿用已有记录。
         final_path = storage.part_path(data_dir, delivery_id, spec.index)
         now = db.utcnow()
-        with db.write_tx(conn):
-            current = conn.execute(
-                """SELECT accepted_at, source FROM shards
-                   WHERE delivery_id = ? AND shard_index = ?""",
-                (int(delivery_id), spec.index),
-            ).fetchone()
-            still_missing = conn.execute(
-                """SELECT COUNT(*) AS n FROM shards
-                   WHERE delivery_id = ? AND accepted_at IS NULL""",
-                (int(delivery_id),),
-            ).fetchone()["n"]
-            if current is not None and current["accepted_at"] is not None:
-                return _reuse_result(
-                    current,
-                    spec.index,
-                    "该片已由实交完成，本次恢复未写入，沿用已有记录",
+        final_written = False
+        try:
+            with db.write_tx(conn):
+                current = conn.execute(
+                    """SELECT accepted_at, source FROM shards
+                       WHERE delivery_id = ? AND shard_index = ?""",
+                    (int(delivery_id), spec.index),
+                ).fetchone()
+                still_missing = conn.execute(
+                    """SELECT COUNT(*) AS n FROM shards
+                       WHERE delivery_id = ? AND accepted_at IS NULL""",
+                    (int(delivery_id),),
+                ).fetchone()["n"]
+                if current is not None and current["accepted_at"] is not None:
+                    return _reuse_result(
+                        current,
+                        spec.index,
+                        "该片已由实交完成，本次恢复未写入，沿用已有记录",
+                    )
+                if still_missing != 1:
+                    raise HandoverError(
+                        "缺片状态已变化，未完成恢复，请刷新后重试", 409
+                    )
+                _safe_replace(recovered_tmp, final_path)
+                recovered_tmp = None
+                final_written = True
+                conn.execute(
+                    """UPDATE shards
+                       SET stored_size = ?, stored_sha256 = ?, source = 'recovered',
+                           accepted_at = ?
+                       WHERE delivery_id = ? AND shard_index = ?""",
+                    (spec.size, rec_sha, now, int(delivery_id), spec.index),
                 )
-            if still_missing != 1:
-                raise HandoverError("缺片状态已变化，未完成恢复，请刷新后重试", 409)
-            _safe_replace(recovered_tmp, final_path)
-            recovered_tmp = None
-            conn.execute(
-                """UPDATE shards
-                   SET stored_size = ?, stored_sha256 = ?, source = 'recovered',
-                       accepted_at = ?
-                   WHERE delivery_id = ? AND shard_index = ?""",
-                (spec.size, rec_sha, now, int(delivery_id), spec.index),
-            )
-            conn.execute(
-                """UPDATE deliveries
-                   SET updated_at = ?, recovered_index = ?, recovered_at = ?
-                   WHERE id = ?""",
-                (now, spec.index, now, int(delivery_id)),
-            )
+                conn.execute(
+                    """UPDATE deliveries
+                       SET updated_at = ?, recovered_index = ?, recovered_at = ?
+                       WHERE id = ?""",
+                    (now, spec.index, now, int(delivery_id)),
+                )
+        except BaseException:
+            if final_written:
+                # 入账未成功：删除本次写出的分片，已验收的记录不受影响。
+                storage.remove_file(final_path)
+            raise
         return {
             "status": "recovered",
             "index": spec.index,
@@ -403,8 +418,6 @@ def recover_missing(delivery_id: int, index: int, file_storage) -> dict:
             "message": f"片 {spec.index} 已由校验片恢复并通过哈希核验",
         }
     finally:
-        if staging is not None:
-            storage.remove_file(staging)
         if recovered_tmp is not None:
             storage.remove_file(recovered_tmp)
 
